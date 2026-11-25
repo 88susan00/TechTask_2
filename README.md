@@ -1,226 +1,152 @@
-# Multi-Site Reverse Proxy Infrastructure (DevOps Test Task)
+# Multi-Site Reverse Proxy with Docker Compose and Self-Healing
 
-Повноцінне рішення для розгортання та автоматичного моніторингу мультисайтового веб-середовища на базі Docker Compose із маршрутизацією через Nginx Reverse Proxy, налаштуванням фаєрволу та watchdog-скриптом самовідновлення (auto-healing).
+[Українська версія](README.uk.md)
 
----
+Three websites (two static, one PHP) behind a single Nginx reverse proxy on one VPS. Every service has a healthcheck, a watchdog restarts unhealthy containers, and the firewall exposes only SSH and HTTP.
 
-## Архітектура проекту
-
-Стек складається з наступних компонентів, що працюють у єдиній ізольованій Docker-мережі (`web`):
+## Architecture
 
 ```
-                       [ Інтернет / Клієнт ]
-                                 │
-                            Порт 80 (HTTP)
-                                 ▼
-                     ┌───────────────────────┐
-                     │  Nginx Reverse Proxy  │
-                     │     (порт 80:80)      │
-                     └───────────┬───────────┘
-                                 │
-     ┌───────────────────────────┼───────────────────────────┐
-     │ /site1/                   │ /site2/                   │ /site3/
-     ▼                           ▼                           ▼
-┌──────────────┐            ┌──────────────┐            ┌────────────────────────┐
-│    site1     │            │    site2     │            │         site3          │
-│ (Static HTML)│            │ (Static HTML)│            │   (PHP 8.3 CLI Built-in)│
-│  порт 80     │            │  порт 80     │            │      порт 8083         │
-└──────────────┘            └──────────────┘            └────────────────────────┘
-                                                                    
+                     [ Client ]
+                         │
+                     port 80 (HTTP)
+                         ▼
+             ┌───────────────────────┐
+             │  Nginx reverse proxy  │
+             │   /healthz            │
+             └───────────┬───────────┘
+     ┌───────────────────┼───────────────────┐
+     │ /site1/           │ /site2/           │ /site3/
+     ▼                   ▼                   ▼
+┌─────────────┐    ┌─────────────┐    ┌──────────────────┐
+│   site1     │    │   site2     │    │      site3       │
+│ static HTML │    │ static HTML │    │ PHP 8.3, :8083   │
+└─────────────┘    └─────────────┘    └──────────────────┘
+        all services share the isolated Docker network "web"
 ```
 
-* **`proxy` (Nginx:alpine):** Єдина публічна точка входу (порт `80`). Приймає запити, прокидає заголовки клієнта (`Host`, `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`) та перенаправляє трафік на відповідні внутрішні сервіси.
-* **`site1` & `site2`:** Статичні веб-сервери Nginx, доступні за шляхами `/site1/` та `/site2/`.
-* **`site3`:** PHP-додаток на базі PHP 8.3 CLI (слухає порт `8083`), доступний за шляхом `/site3/`, з вбудованим ендпоінтом `/healthz` для моніторингу стану.
-* **Watchdog Script (`all-services-check.sh`):** Фоновий скрипт для регулярної перевірки працездатності контейнерів через Docker Health status та автоматичного перезапуску в разі збою.
+- **proxy** (`nginx:alpine`): the only public entry point. Routes `/site1/`, `/site2/`, `/site3/` to the backends and forwards `Host`, `X-Real-IP`, `X-Forwarded-For`, `X-Forwarded-Proto`.
+- **site1, site2**: static sites on Nginx.
+- **site3**: PHP 8.3 app on the built-in server, port 8083.
+- **Healthchecks**: every service, the proxy included, exposes `/healthz`. The proxy starts only after all backends are healthy.
+- **Watchdog** (`all-services-check.sh`): runs as a systemd service and recreates any container that is unhealthy or stopped. Docker's `restart: unless-stopped` only reacts to a container exiting, not to a failed healthcheck. After recreating a backend it reloads the proxy, so Nginx picks up the new container IP.
 
----
+## Repository layout
 
-## 📂 Структура репозиторію
-
-```text
-TechTask_BullsMedia/
-├── docker-compose.yml        # Головний маніфест запуску та зв'язку сервісів
-├── all-services-check.sh     # Скрипт моніторингу та автоперезапуску сервісів
-├── proxy/
-│   └── nginx.conf            # Конфігурація зворотного проксі (upstream та location)
-├── site1/
-│   ├── Dockerfile
-│   ├── index.html
-│   └── nginx.conf
-├── site2/
-│   ├── Dockerfile
-│   ├── index.html
-│   └── nginx.conf
-├── site3/
-│   ├── Dockerfile            # Збірка PHP 8.3 CLI контейнера (порт 8083)
-│   └──index.php             # Основний додаток та обробка /healthz
-└── README.md                 # Документація та покрокова інструкція
+```
+.
+├── docker-compose.yml      # services, healthchecks, network
+├── all-services-check.sh   # watchdog with auto-restart
+├── proxy/nginx.conf        # reverse proxy config
+├── site1/                  # Dockerfile, nginx.conf, index.html
+├── site2/                  # Dockerfile, nginx.conf, index.html
+└── site3/                  # Dockerfile, index.php (+ /healthz)
 ```
 
----
+## Deploy on a clean server
 
-## Покрокова інструкція розгортання на «голому» сервері (Bare-metal / VPS)
+Tested on Ubuntu 22.04 / 24.04 and Debian 12.
 
-Інструкція протестована на **Ubuntu 22.04 / 24.04 LTS** (GCP / Oracle Cloud / AWS).
-
-### Крок 1: Оновлення системи та встановлення базових утиліт
-
-Підключіться до сервера через SSH та оновіть системні пакети:
+### 1. System packages
 
 ```bash
 sudo apt update && sudo apt upgrade -y
-sudo apt install git ufw -y
+sudo apt install -y git ufw
 ```
 
----
+### 2. Firewall
 
-### Крок 2: Налаштування фаєрволу (UFW)
-
-Забезпечуємо принцип мінімальних привілеїв: відкриваємо тільки порти `22` (SSH) та `80` (HTTP).
+Allow SSH **before** enabling the firewall, otherwise you lock yourself out of the server.
 
 ```bash
-# Встановлюємо політику за замовчуванням
-sudo ufw enable
-
-# Відкриваємо критично важливі порти
-sudo ufw allow 22/tcp comment 'SSH Access'
-sudo ufw allow 80/tcp comment 'HTTP Web Traffic'
-
-# Активуємо фаєрвол (підтвердіть дію 'y')
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow 22/tcp comment 'SSH'
+sudo ufw allow 80/tcp comment 'HTTP'
 sudo ufw --force enable
-
-# Перевіряємо статус
 sudo ufw status verbose
 ```
 
----
+> Docker publishes ports through its own iptables rules, which bypass UFW. Only the proxy publishes a port (80), so no backend is exposed.
 
-### Крок 3: Встановлення Docker та Docker Compose (Official Engine)
-
-Встановлюємо офіційний Docker Engine та Docker Compose Plugin:
+### 3. Docker Engine and Compose plugin
 
 ```bash
-sudo apt remove docker.io docker-compose docker-doc podman-docker containerd runc -y
-sudo apt install ca-certificates curl gnupg lsb-release -y
-
+sudo apt install -y ca-certificates curl
 sudo install -m 0755 -d /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/debian/gpg | sudo tee /etc/apt/keyrings/docker.asc > /dev/null
+. /etc/os-release   # sets $ID (ubuntu or debian) and $VERSION_CODENAME
+sudo curl -fsSL "https://download.docker.com/linux/${ID}/gpg" -o /etc/apt/keyrings/docker.asc
 sudo chmod a+r /etc/apt/keyrings/docker.asc
-
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
-https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
-| sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${ID} ${VERSION_CODENAME} stable" \
+  | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
 sudo apt update
-sudo apt install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y
+sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+# Run docker without sudo (log out and back in afterwards)
+sudo usermod -aG docker "$USER"
 ```
 
----
-
-### Крок 4: Клонування репозиторію
-
-Створюємо робочу директорію та клонуємо проект:
+### 4. Clone and start
 
 ```bash
-mkdir TechTask_BullsMedia
-cd TechTask_BullsMedia
-git init
-git clone https://github.com/88susan00/TechTask_BullsMedia.git TechTask_BullsMedia
-```
-
----
-
-### Крок 5: Запуск проекту через Docker Compose
-
-Збираємо образи та піднімаємо всі сервіси у фоновому режимі:
-
-```bash
+git clone https://github.com/88susan00/TechTask_2.git
+cd TechTask_2
 docker compose up -d --build
-```
-
-Перевірте статус запущених контейнерів:
-```bash
 docker compose ps
 ```
-Усі сервіси (`proxy`, `site1`, `site2`, `site3`) повинні мати статус `Up`, а для `site1/2/3` стан повинен бути `(healthy)`.
 
----
+All four services should show `Up (healthy)` within about a minute.
 
-## 🔍 Перевірка працездатності сервісів
-
-Виконайте запити локально або з будь-якого зовнішнього комп'ютера:
+## Verify
 
 ```bash
-# 1. Перевірка статичного Site 1
-curl -I http://<IP_СЕРВЕРА>/site1/
+curl -I http://<SERVER_IP>/site1/
+curl -I http://<SERVER_IP>/site2/
+curl    http://<SERVER_IP>/site3/
 
-# 2. Перевірка статичного Site 2
-curl -I http://<IP_СЕРВЕРА>/site2/
-
-# 3. Перевірка PHP додатку Site 3
-curl http://<IP_СЕРВЕРА>/site3/
-
-# 4. Перевірка Healthcheck ендпоінту Site 1, 2, 3
-curl -i http://<IP_СЕРВЕРА>/site(1, 2, 3)/healthz
-# Очікувана відповідь: HTTP/1.1 200 OK, тіло: OK
+# Healthchecks: expect HTTP 200 and body "OK"
+curl -i http://<SERVER_IP>/healthz
+for s in site1 site2 site3; do curl -s "http://<SERVER_IP>/$s/healthz"; echo " <- $s"; done
 ```
 
----
+## Watchdog as a systemd service
 
-## 🛡 Watchdog & Автоматичне відновлення (Self-Healing)
+Create `/etc/systemd/system/techtask-watchdog.service` (replace `<USER>` with your user name):
 
-У проекті реалізовано скрипт перевірки працездатності `all-services-check.sh`. Він аналізує стан контейнерів через Docker Health API та у разі виникнення помилок або зависання перезапускає відповідний сервіс.
-
-### Запуск скрипту моніторингу:
-
-```bash
-# Надаємо права на виконання
-chmod +x all-services-check.sh
-
-# Створюємо unit‑файл
-sudo nano /etc/systemd/system/techtask.service
-```
-
-### Вміст techtask.service
-```bash
+```ini
 [Unit]
-Description=TechTask BullsMedia startup script
-After=network.target
+Description=TechTask watchdog: recreates unhealthy containers
+After=docker.service network-online.target
+Requires=docker.service
 
 [Service]
-ExecStart=/home/<ІМʼЯ ВАШОГО КОРИСТУВАЧА>/TechTask_BullsMedia/all-services-check.sh
+User=<USER>
+ExecStart=/home/<USER>/TechTask_2/all-services-check.sh
 Restart=always
-User=<ІМʼЯ ВАШОГО КОРИСТУВАЧА>
-WorkingDirectory=/home/mkiselyov88/TechTask_BullsMedia
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-### Запуск та керування сервісом:
+The script changes to its own directory, so it finds `docker-compose.yml` no matter where it is started from. The user must be in the `docker` group (step 3).
+
 ```bash
-# Перезавантажуємо systemd
+chmod +x all-services-check.sh
 sudo systemctl daemon-reload
-
-# Активуємо автозапуск
-sudo systemctl enable techtask.service
-
-# Запускаємо вручну для перевірки
-sudo systemctl start techtask.service
+sudo systemctl enable --now techtask-watchdog.service
+journalctl -u techtask-watchdog.service -f
 ```
 
-Перегляд логів роботи watchdog:
+### Test self-healing
+
+Break a backend's healthcheck from inside the container and watch the watchdog fix it:
+
 ```bash
-systemctl status techtask.service
-journalctl -u techtask.service -f
+docker compose exec site1 sh -c "sed -i 's/return 200/return 500/' /etc/nginx/conf.d/default.conf && nginx -s reload"
+journalctl -u techtask-watchdog.service -f   # "site1: unhealthy, recreating" after ~90 s
 ```
 
----
+The watchdog recreates the container from its image, so the broken config is gone and `site1` becomes healthy again. A plain `docker restart` would not help here: it keeps the container's filesystem, broken file included.
 
-## Final
-Середовище Debian 12 успішно підготовлене для роботи з проектом TechTask BullsMedia.
-Git встановлено для керування репозиторіями.
-Docker налаштований для контейнеризації та запуску сервісів.
-UFW Firewall активний, дозволяє лише SSH та HTTP‑трафік.
-Systemd‑сервіс забезпечує автозапуск скрипта all-services-check.sh при старті VM.
+The check interval defaults to 30 seconds; override it with `CHECK_INTERVAL` (e.g. `Environment=CHECK_INTERVAL=15` in the unit).

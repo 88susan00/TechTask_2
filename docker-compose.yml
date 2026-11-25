@@ -1,3 +1,5 @@
+name: techtask
+
 services:
 
   site1:
@@ -6,12 +8,12 @@ services:
     networks:
       - web
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost/healthz"]
+      # nginx:alpine has busybox wget, curl is not guaranteed
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/healthz"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 20s
-
 
   site2:
     build: ./site2
@@ -19,7 +21,7 @@ services:
     networks:
       - web
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost/healthz"]
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/healthz"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -40,18 +42,24 @@ services:
   proxy:
     image: nginx:alpine
     restart: unless-stopped
-
     ports:
       - "80:80"
-
     volumes:
       - ./proxy/nginx.conf:/etc/nginx/nginx.conf:ro
-
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    # Start the proxy only when the backends are actually healthy, not just started.
     depends_on:
-      - site1
-      - site2
-      - site3
-
+      site1:
+        condition: service_healthy
+      site2:
+        condition: service_healthy
+      site3:
+        condition: service_healthy
     networks:
       - web
 
